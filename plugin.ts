@@ -385,13 +385,14 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
             .describe("auto = 按阶段信号自动判断；typecheck/lint = 只跑指定检查；all = 全部"),
         },
         async execute(args, context) {
+          const scope = args.scope ?? "auto"
           const cwd = context.directory
           const st = getState(context.sessionID)
           st.cwd = cwd
           const baseline = await harness.initialize(cwd)
           st.baselineHead = baseline.gitHead
           const evidence = await collectEvidence(context.sessionID, cwd, baseline.gitHead, true)
-          const outcome = await harness.afterTurn(evidence)
+          let outcome = await harness.afterTurn(evidence)
 
           if (outcome.securityAlert) {
             return { title: "lidar_verify", output: outcome.securityAlert, metadata: { tier: outcome.tier } }
@@ -401,9 +402,15 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
             const fallback: string[] = []
             const cmds: Array<[string, string[]]> = []
             const tc = opts.typecheckCmd ?? (await autoDetectCmd(cwd, "typecheck"))
-            if (tc) cmds.push(["typecheck", tc])
             const lintC = opts.lintCmd ?? (await autoDetectCmd(cwd, "lint"))
-            if (lintC) cmds.push(["lint", lintC])
+
+            // 按 scope 过滤
+            if ((scope === "typecheck" || scope === "all" || scope === "auto") && tc) {
+              cmds.push(["typecheck", tc])
+            }
+            if ((scope === "lint" || scope === "all" || scope === "auto") && lintC) {
+              cmds.push(["lint", lintC])
+            }
             for (const [kind, cmd] of cmds) {
               const safe = isCommandSafe(cmd, ["bun", "bunx", "npx", "npm", "pnpm", "yarn", "deno", "tsc", "eslint", "biome"])
               if (!safe.safe) {
@@ -419,6 +426,19 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
               output: fallback.join("\n\n") || "没有检测到阶段信号，且未配置可运行的检查命令。",
               metadata: { tier: 0, skipped: true },
             }
+          }
+
+          // scope 过滤：从 outcome 中去除非目标类型的新错误
+          if (scope === "typecheck") {
+            outcome.newErrors = outcome.newErrors.filter(
+              (e) => !e.startsWith("🟡") && !(e.startsWith("⚠️") && e.includes(" lint ")),
+            )
+            outcome.newErrorCount = outcome.newErrors.length
+          } else if (scope === "lint") {
+            outcome.newErrors = outcome.newErrors.filter(
+              (e) => !e.startsWith("🔴") && !(e.startsWith("⚠️") && e.includes(" typecheck ")),
+            )
+            outcome.newErrorCount = outcome.newErrors.length
           }
 
           let report = buildReport(outcome)
@@ -468,3 +488,5 @@ async function autoDetectCmd(cwd: string, kind: "typecheck" | "lint"): Promise<s
     return null
   }
 }
+
+export default lidarHarness

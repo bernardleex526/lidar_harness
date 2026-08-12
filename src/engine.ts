@@ -89,6 +89,8 @@ export interface VerifyOutcome {
   converged: boolean
   needsReview: boolean
   securityAlert?: string
+  /** true = 至少一个检查的 baseline 因命令不安全而未建立，当前 newErrors 可能包含历史错误 */
+  baselineIncomplete?: boolean
   baseline: ProjectBaseline
   durationMs: number
 }
@@ -404,9 +406,17 @@ export class Harness {
     const typecheckCmd = this.opts.typecheckCmd ?? auto.typecheck ?? null
     const lintCmd = this.opts.lintCmd ?? auto.lint ?? null
 
+    const tcSafe = typecheckCmd ? isCommandSafe(typecheckCmd, this.opts.safePrefixes) : null
+    const lintSafe = lintCmd ? isCommandSafe(lintCmd, this.opts.safePrefixes) : null
+    if (tcSafe && !tcSafe.safe) {
+      console.warn(`[lidar-harness] initialize: skipping typecheck baseline — ${tcSafe.reason}`)
+    }
+    if (lintSafe && !lintSafe.safe) {
+      console.warn(`[lidar-harness] initialize: skipping lint baseline — ${lintSafe.reason}`)
+    }
     const [tcOut, lintOut, head] = await Promise.all([
-      typecheckCmd ? runCommand(cwd, typecheckCmd, this.opts.commandTimeoutMs) : null,
-      lintCmd ? runCommand(cwd, lintCmd, this.opts.commandTimeoutMs) : null,
+      (typecheckCmd && tcSafe?.safe) ? runCommand(cwd, typecheckCmd, this.opts.commandTimeoutMs) : null,
+      (lintCmd && lintSafe?.safe) ? runCommand(cwd, lintCmd, this.opts.commandTimeoutMs) : null,
       this.gitHead(cwd),
     ])
 
@@ -417,6 +427,16 @@ export class Harness {
       gitHead: head,
       scriptsHash: hashScripts(scripts),
       createdAt: Date.now(),
+    }
+    if (typecheckCmd && !tcSafe?.safe) {
+      console.warn(
+        `[lidar-harness] typecheck 基线未建立（命令不安全），后续所有 typecheck 错误将被视为新增直到配置合法命令。`
+      )
+    }
+    if (lintCmd && !lintSafe?.safe) {
+      console.warn(
+        `[lidar-harness] lint 基线未建立（命令不安全），后续所有 lint 错误将被视为新增直到配置合法命令。`
+      )
     }
     const freshState: PersistedState = {
       projectKey: key,
@@ -545,7 +565,23 @@ export class Harness {
         return [`⚠️ 跳过 ${kind}：${safe.reason}`]
       }
       const r = await runCommand(cwd, cmd, this.opts.commandTimeoutMs)
+      // 命令执行失败（超时、spawn 错误、非零退出）时不能静默为"已收敛"：
+      // 必须上报失败，否则检查工具未运行成功却让 converged=true（fail-open）。
+      if (r.timedOut) {
+        return [`⚠️ ${kind} 命令超时（${this.opts.commandTimeoutMs}ms），本轮验证结果不可信`]
+      }
+      if (r.code === null) {
+        // spawn 失败（可执行文件不存在等）
+        const errMsg = r.stderr.trim().slice(0, 200) || "spawn error"
+        return [`⚠️ ${kind} 命令无法启动（${errMsg}），本轮验证结果不可信`]
+      }
       const parsed = parseCommandOutput(`${r.stdout}\n${r.stderr}`)
+      // 非零退出且无任何可解析的错误签名：checker 可能静默失败，不能视为"无新错误"
+      if (!r.ok && r.code !== null && parsed.length === 0) {
+        return [
+          `⚠️ ${kind} 命令以非零退出（exit ${r.code}）但无可解析输出，本轮验证结果不可信`,
+        ]
+      }
       const prev = new Set([...baselineSigs, ...state[shownKey]])
       const delta = computeDelta(prev, parsed)
       state[shownKey].push(...delta)
@@ -569,9 +605,12 @@ export class Harness {
       newErrors,
       newErrorCount: newErrors.length,
       totalSeen,
-      converged: newErrors.length === 0,
+      converged: newErrors.length === 0 && !newErrors.some((e) => e.startsWith("⚠️")),
       needsReview: newErrors.length >= this.opts.noiseFloor,
       securityAlert,
+      baselineIncomplete:
+        (baseline.typecheckSigs.length === 0 && typecheckCmd !== null) ||
+        (baseline.lintSigs.length === 0 && lintCmd !== null),
       baseline,
       durationMs: Date.now() - t0,
     }
