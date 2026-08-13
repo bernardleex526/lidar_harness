@@ -13,10 +13,18 @@
  */
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
-import { spawn } from "node:child_process"
 import * as path from "node:path"
 import * as os from "node:os"
-import { Harness, isCommandSafe, type TurnEvidence, type VerifyOutcome } from "./src/engine.ts"
+import { readFileSync, statSync } from "node:fs"
+import {
+  Harness,
+  detectAutoCommands,
+  isCommandSafe,
+  readPackageScripts,
+  runCommand,
+  type TurnEvidence,
+  type VerifyOutcome,
+} from "./src/engine.ts"
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -41,6 +49,8 @@ export interface HarnessPluginOptions {
   }
   /** 状态持久化目录 */
   dataDir?: string
+  /** 可执行文件白名单（默认最小集；ROS/CMake/Python 项目可按需扩展，如 cmake/colcon/python） */
+  safePrefixes?: string[]
 }
 
 const SLAM_PROTOCOL = `## SLAM 验证协议（LiDAR Harness）
@@ -66,42 +76,91 @@ function unwrap<T>(r: T | { data: T }): T {
   return (v && typeof v === "object" && "data" in v ? (v.data as T) : r) as T
 }
 
-function runGit(cwd: string, args: string[], timeoutMs = 10_000): Promise<string> {
-  return new Promise((resolve) => {
-    let out = ""
-    let err = ""
-    const child = spawn("git", args, { cwd, shell: false, windowsHide: true })
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL")
-    }, timeoutMs)
-    child.stdout.on("data", (d) => (out += d.toString()))
-    child.stderr.on("data", (d) => (err += d.toString()))
-    child.on("error", () => resolve(""))
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      resolve(code === 0 ? out : "")
-    })
-  })
+/** git 只读命令封装（复用引擎的 runCommand：无 shell、输出有界、超时杀进程树） */
+async function runGit(cwd: string, args: string[], timeoutMs = 10_000): Promise<string> {
+  const r = await runCommand(cwd, ["git", ...args], timeoutMs)
+  return r.ok ? r.stdout : ""
 }
 
-function runCommand(cwd: string, cmd: string[], timeoutMs: number): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    let out = ""
-    let err = ""
-    const child = spawn(cmd[0], cmd.slice(1), { cwd, shell: false, windowsHide: true })
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs)
-    child.stdout.on("data", (d) => (out += d.toString()))
-    child.stderr.on("data", (d) => (err += d.toString()))
-    child.on("error", () => resolve({ ok: false, output: "" }))
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      resolve({ ok: code === 0, output: `${out}\n${err}` })
-    })
-  })
+// ---------------------------------------------------------------------------
+// Tier 3 有界上下文采集（baseline commit → 工作区，含 staged/committed since baseline + untracked）
+// ---------------------------------------------------------------------------
+
+/** Tier 3 diff 上下文总上限（字节） */
+export const TIER3_DIFF_STAT_CAP = 2_000
+export const TIER3_DIFF_CAP = 8_000
+/** 未跟踪文件内容预览：单文件上限 */
+export const TIER3_UNTRACKED_PER_FILE_CAP = 2 * 1024
+/** 未跟踪文件内容预览：总上限 */
+export const TIER3_UNTRACKED_TOTAL_CAP = 8 * 1024
+
+/**
+ * 有界读取未跟踪文件内容（文本文件预览）：
+ * - 跳过二进制（含 NUL）、不可读、超大（> 4×单文件上限）的文件
+ * - 单文件 ≤ maxPerFileBytes，总量 ≤ maxTotalBytes（先到先得）
+ */
+export function boundedUntrackedContents(
+  cwd: string,
+  files: string[],
+  maxTotalBytes = TIER3_UNTRACKED_TOTAL_CAP,
+  maxPerFileBytes = TIER3_UNTRACKED_PER_FILE_CAP,
+): string {
+  if (!files || files.length === 0) return ""
+  const out: string[] = []
+  let total = 0
+  for (const f of files) {
+    if (total >= maxTotalBytes) break
+    const p = path.join(cwd, f)
+    try {
+      if (statSync(p).size > maxPerFileBytes * 4) continue
+      const buf = readFileSync(p)
+      if (buf.includes(0)) continue
+      const text = buf.subarray(0, maxPerFileBytes).toString("utf8").replace(/\r/g, "")
+      out.push(`### ${f}\n\`\`\`\n${text}\n\`\`\``)
+      total += text.length
+    } catch {
+      /* 忽略不可读文件 */
+    }
+  }
+  return out.join("\n")
+}
+
+export interface Tier3Context {
+  statText: string
+  diffText: string
+  untrackedText: string
+}
+
+/**
+ * 采集 Tier 3 有界上下文：
+ * - `git diff <baselineHead>` 覆盖 **baseline commit → 工作区** 的全部 tracked 变更
+ *   （含 staged 与 committed-since-baseline；工作区视角下 staged+unstaged 合并呈现）
+ * - 未跟踪文件（`ls-files --others --exclude-standard`）以有界内容预览纳入上下文
+ * - stat ≤ 2KB、unified diff ≤ 8KB、untracked 总量 ≤ 8KB（引擎侧另有 256KB 硬上限兜底）
+ */
+export async function collectTier3Context(
+  cwd: string,
+  baselineHead: string,
+  runGitFn: (cwd: string, args: string[], timeoutMs?: number) => Promise<string> = runGit,
+): Promise<Tier3Context> {
+  const base = baselineHead || "HEAD"
+  const [stat, diff, untrackedNames] = await Promise.all([
+    runGitFn(cwd, ["diff", "--stat", base]),
+    runGitFn(cwd, ["diff", "--unified=3", base]),
+    runGitFn(cwd, ["ls-files", "--others", "--exclude-standard"]),
+  ])
+  const statText = stat.slice(0, TIER3_DIFF_STAT_CAP) || "(无 diff)"
+  const diffText =
+    diff.length > TIER3_DIFF_CAP
+      ? `${diff.slice(0, TIER3_DIFF_CAP)}\n…（diff 已截断，仅展示前 8KB）`
+      : diff || "(无 diff)"
+  const untrackedFiles = untrackedNames.split(/\r?\n/).filter(Boolean)
+  const untrackedText = boundedUntrackedContents(cwd, untrackedFiles)
+  return { statText, diffText, untrackedText }
 }
 
 /** 从 assistant 消息的 tool parts 中提取 TodoWrite 输入里的 todos */
-function extractTodos(input: unknown): Array<{ id: string; status: string }> {
+export function extractTodos(input: unknown): Array<{ id: string; status: string }> {
   const list: Array<{ id: string; status: string }> = []
   const obj = (input ?? {}) as { todos?: unknown; todo?: unknown }
   const collect = (t: unknown) => {
@@ -115,11 +174,48 @@ function extractTodos(input: unknown): Array<{ id: string; status: string }> {
   return list
 }
 
-function summarizeText(parts: Array<{ type: string; text?: string }>): string {
+export function summarizeText(parts: Array<{ type: string; text?: string }>): string {
   return (parts ?? [])
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text!)
     .join("\n")
+}
+
+/** 构建注入报告（安全告警 / 基线不完整 / Tier 2 增量错误） */
+export function buildReport(o: VerifyOutcome): string {
+  const lines: string[] = []
+  if (o.securityAlert) {
+    lines.push(`## 🧭 LiDAR Harness · 安全告警`, ``, o.securityAlert, ``)
+  }
+  if (o.baselineIncomplete) {
+    lines.push(
+      `## 🧭 LiDAR Harness · 基线不完整`,
+      ``,
+      `至少一个检查命令的基线未成功建立（命令不安全 / 无法启动 / 超时 / 无输出）。` +
+        `本次报告的"新错误"可能包含历史遗留错误，请修复检查命令或重置状态目录后重新初始化基线。`,
+      ``,
+    )
+  }
+  if (o.verificationIncomplete) {
+    lines.push(
+      `## 🧭 LiDAR Harness · 验证不完整`,
+      ``,
+      `至少一个检查器本轮不可用或结果不可信（命令不安全 / 无法启动 / 超时 / 非零退出且无输出 / 输出截断）。` +
+        `本轮不视为收敛；请修复检查命令后重试。`,
+      ``,
+    )
+  }
+  if (o.newErrors.length > 0) {
+    lines.push(
+      `## 🧭 LiDAR Harness · Tier 2 验证报告（增量 ${o.newErrorCount} 个新错误）`,
+      ``,
+      `请修复以下错误，仅修正当前阶段范围：`,
+      ``,
+      ...o.newErrors.map((e) => `- ${e}`),
+      ``,
+    )
+  }
+  return lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +232,7 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
     lintCmd: opts.lintCmd ?? null,
     noiseFloor: opts.noiseFloor ?? 3,
     dataDir,
+    ...(opts.safePrefixes ? { safePrefixes: opts.safePrefixes } : {}),
   })
 
   const reviewPrompts = { ...DEFAULT_REVIEW_PROMPTS, ...opts.reviewPrompts }
@@ -264,29 +361,14 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
     }
   }
 
-  /** 构建注入报告 */
-  function buildReport(o: VerifyOutcome): string {
-    const lines: string[] = []
-    if (o.securityAlert) {
-      lines.push(`## 🧭 LiDAR Harness · 安全告警`, ``, o.securityAlert, ``)
-    }
-    if (o.newErrors.length > 0) {
-      lines.push(
-        `## 🧭 LiDAR Harness · Tier 2 验证报告（增量 ${o.newErrorCount} 个新错误）`,
-        ``,
-        `请修复以下错误，仅修正当前阶段范围：`,
-        ``,
-        ...o.newErrors.map((e) => `- ${e}`),
-        ``,
-      )
-    }
-    return lines.join("\n")
-  }
-
-  /** Tier 3：并行 3 个一次性 review 会话，合并结果 */
-  async function runTier3(cwd: string, o: VerifyOutcome): Promise<string> {
-    const files = (o.phaseSignals?.gitFilesChanged ?? []).slice(0, 15).join("\n") || "(无文件变更)"
+  /** Tier 3：并行 3 个一次性 review 会话（基线 diff + 有界 untracked 上下文），合并结果 */
+  async function runTier3(cwd: string, o: VerifyOutcome, baselineHead: string): Promise<string> {
+    const files = (o.phaseSignals?.gitFilesChanged ?? []).slice(0, 15)
+    const filesText = files.join("\n") || "(无文件变更)"
     const errors = o.newErrors.slice(0, 20).join("\n")
+    // 有界上下文：diff 覆盖 baseline commit → 工作区（含 staged / committed since baseline），
+    // stat ≤ 2KB、unified diff ≤ 8KB、untracked 内容预览 ≤ 8KB（引擎侧另有 256KB 硬上限兜底）
+    const ctx = await collectTier3Context(cwd, baselineHead)
     const roles: Array<[string, string]> = [
       ["安全", reviewPrompts.safety!],
       ["正确性", reviewPrompts.correctness!],
@@ -294,8 +376,14 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
     ]
     const results = await Promise.allSettled(
       roles.map(async ([name, role]) => {
-        const promptText = `${role}\n\n项目目录: ${cwd}\n\n变更文件:\n${files}\n\n验证发现的新错误:\n${errors}\n\n请给出你的审查结论。`
+        const promptText =
+          `${role}\n\n项目目录: ${cwd}\n\n变更文件:\n${filesText}\n\n` +
+          `diff --stat（相对基线 ${baselineHead || "HEAD"}）:\n${ctx.statText}\n\n` +
+          `变更 diff（相对基线，截断于 8KB）:\n${ctx.diffText}\n\n` +
+          `未跟踪文件内容预览（有界）:\n${ctx.untrackedText || "(无未跟踪文件)"}\n\n` +
+          `验证发现的新错误:\n${errors}\n\n请给出你的审查结论。`
         const created = await client.session.create({
+          query: { directory: cwd },
           body: { title: `lidar-review-${name}` },
         })
         const session = unwrap(created) as { id: string }
@@ -348,7 +436,7 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
 
       let report = buildReport(outcome)
       if (outcome.newErrorCount >= (opts.noiseFloor ?? 3) && opts.tier3 && !outcome.securityAlert) {
-        const review = await runTier3(cwd, outcome)
+        const review = await runTier3(cwd, outcome, baseline.gitHead)
         if (review) report += `\n${review}`
       }
       if (report.trim()) await inject(sessionID, report)
@@ -401,8 +489,10 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
             // 无阶段信号时兜底：直接跑一次安全白名单内的检查，返回原始输出
             const fallback: string[] = []
             const cmds: Array<[string, string[]]> = []
-            const tc = opts.typecheckCmd ?? (await autoDetectCmd(cwd, "typecheck"))
-            const lintC = opts.lintCmd ?? (await autoDetectCmd(cwd, "lint"))
+            // 与引擎同一套检测逻辑（bunx → bun x、typecheck 自动追加 --noEmit）
+            const auto = detectAutoCommands(readPackageScripts(cwd))
+            const tc = opts.typecheckCmd ?? auto.typecheck ?? null
+            const lintC = opts.lintCmd ?? auto.lint ?? null
 
             // 按 scope 过滤
             if ((scope === "typecheck" || scope === "all" || scope === "auto") && tc) {
@@ -412,14 +502,31 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
               cmds.push(["lint", lintC])
             }
             for (const [kind, cmd] of cmds) {
-              const safe = isCommandSafe(cmd, ["bun", "bunx", "npx", "npm", "pnpm", "yarn", "deno", "tsc", "eslint", "biome"])
+              const safe = isCommandSafe(cmd, harness.configuredSafePrefixes)
               if (!safe.safe) {
                 fallback.push(`⚠️ ${kind} 命令不在白名单内，已拒绝执行: ${cmd.join(" ")}`)
                 continue
               }
               const r = await runCommand(cwd, cmd, 120_000)
-              const out = r.output.trim()
-              fallback.push(`### ${kind} (exit ${r.ok ? 0 : "非0"})\n\`\`\`\n${out.slice(0, 2000) || "(无输出)"}\n\`\`\``)
+              const out = `${r.stdout}\n${r.stderr}`.trim()
+              if (r.timedOut) {
+                const killNote =
+                  r.kill && !r.kill.ok
+                    ? `；⚠️ 进程树强杀失败${r.kill.fallbackError ? `（${r.kill.fallbackError}）` : ""}，可能有残留进程`
+                    : "；已尝试终止进程树"
+                fallback.push(
+                  `### ${kind} ⚠️ 超时（120s）${killNote}\n\`\`\`\n${out.slice(0, 2000) || "(无输出)"}\n\`\`\``,
+                )
+                continue
+              }
+              if (r.code === null) {
+                fallback.push(`### ${kind} ⚠️ 无法启动\n\`\`\`\n${out.slice(0, 2000) || "(无输出)"}\n\`\`\``)
+                continue
+              }
+              if (r.truncated) {
+                fallback.push(`### ${kind} ⚠️ 输出超过上限已截断\n`)
+              }
+              fallback.push(`### ${kind} (exit ${r.code})\n\`\`\`\n${out.slice(0, 2000) || "(无输出)"}\n\`\`\``)
             }
             return {
               title: "lidar_verify",
@@ -443,13 +550,18 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
 
           let report = buildReport(outcome)
           if (outcome.newErrorCount >= (opts.noiseFloor ?? 3) && opts.tier3) {
-            const review = await runTier3(cwd, outcome)
+            const review = await runTier3(cwd, outcome, baseline.gitHead)
             if (review) report += `\n${review}`
           }
           return {
             title: "lidar_verify",
             output: report.trim() || "✅ 未发现新错误（相对基线）。",
-            metadata: { tier: outcome.tier, newErrors: outcome.newErrorCount, converged: outcome.converged },
+            metadata: {
+              tier: outcome.tier,
+              newErrors: outcome.newErrorCount,
+              converged: outcome.converged,
+              verificationIncomplete: outcome.verificationIncomplete,
+            },
           }
         },
       }),
@@ -458,34 +570,6 @@ export const lidarHarness: Plugin = async ({ client }, options = {}) => {
     dispose: async () => {
       await harness.dispose()
     },
-  }
-}
-
-/** 从 package.json scripts 检测 typecheck/lint 命令（引擎 same 逻辑的轻量版） */
-async function autoDetectCmd(cwd: string, kind: "typecheck" | "lint"): Promise<string[] | null> {
-  try {
-    const raw = await import("node:fs/promises")
-    const pkg = JSON.parse(await raw.readFile(path.join(cwd, "package.json"), "utf8"))
-    const scripts: Record<string, string> = pkg?.scripts ?? {}
-    const keys = Object.keys(scripts)
-    const pick = (re: RegExp, exact: string[]): string | null => {
-      for (const e of exact) if (scripts[e]) return e
-      return keys.find((k) => re.test(k)) ?? null
-    }
-    const key =
-      kind === "typecheck"
-        ? pick(/typecheck|type-check|^tsc$|^check$/, ["typecheck", "tsc"])
-        : pick(/^lint$|^eslint$/, ["lint", "eslint"])
-    if (!key) return null
-    const cmdStr = scripts[key]
-    const parts = cmdStr.split(/\s+/)
-    if (parts[0] === "bun" && parts[1] === "run") return ["bun", ...parts.slice(2)]
-    if (parts[0] === "npm" && parts[1] === "run") return ["npm", "run", ...parts.slice(2)]
-    if (parts[0] === "pnpm") return ["pnpm", ...parts.slice(1)]
-    if (parts[0] === "yarn") return ["yarn", ...parts.slice(1)]
-    return parts
-  } catch {
-    return null
   }
 }
 
