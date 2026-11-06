@@ -561,7 +561,13 @@ export function runCommand(cwd: string, cmd: string[], timeoutMs: number): Promi
       resolve({ ok: false, code: null, stdout: "", stderr: "空命令", timedOut: false, truncated: false, killFailed: false })
       return
     }
-    const exe = resolveExecutable(cmd[0])
+    const resolved = resolveExecutable(cmd[0])
+    // POSIX: resolveExecutable passes bare names through; check PATH here so a
+    // missing tool gets the same explicit message as on Windows.
+    const exe =
+      resolved && process.platform !== "win32" && !resolved.includes("/") && Bun.which(resolved) === null
+        ? null
+        : resolved
     if (!exe) {
       resolve({
         ok: false,
