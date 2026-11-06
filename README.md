@@ -6,7 +6,7 @@
 <p align="center">
   <a href="#"><img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.6-blue?style=flat-square"/></a>
   <a href="#"><img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square"/></a>
-  <a href="#"><img alt="Tests" src="https://img.shields.io/badge/Tests-77%20passed-brightgreen?style=flat-square"/></a>
+  <a href="https://github.com/bernardleex526/lidar_harness/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/bernardleex526/lidar_harness/actions/workflows/ci.yml/badge.svg"/></a>
   <a href="#"><img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square"/></a>
 </p>
 
@@ -16,7 +16,7 @@
 
 受 SLAM（即时定位与地图构建）中 **PGO（位姿图优化）**、**Scan Context（扫描上下文）** 等核心思想启发，为编码 Agent 设计的多层级验证框架：**在 Agent 每轮操作结算后自动运行 typecheck / lint，只把"新增的错误"注入回对话**，让模型像 SLAM 修正位姿漂移一样局部收紧、收敛迭代——而不是等任务结束才发现一堆问题。
 
-最初的设计构想来自 [bernardleex526/lidar_harness 早期 README](https://github.com/bernardleex526/lidar_harness)（一个未落地代码的 SLAM→验证映射构想）。本仓库是该构想的**完整可用实现**，以 opencode 插件 + 零依赖核心引擎的形式交付。
+最初的设计构想来自本仓库早期的一版 README（一个未落地代码的 SLAM→验证映射构想，该版本已不在提交历史中）。本仓库是该构想的**完整可用实现**，以 opencode 插件 + 零依赖核心引擎的形式交付。
 
 ## SLAM → Code Verification 映射
 
@@ -186,7 +186,7 @@ lidar-harness/
 
 ```bash
 bun install          # 安装依赖（frozen lockfile）
-bun test             # 77 项测试：签名归一化 / 解析 / 增量 / 收敛 / 白名单 / 安全锁 / 门控 / 故障分支 / 基线可信 / 强杀 / 输出字节上限 / Tier3 上下文 / 插件
+bun test             # 80 项测试：签名归一化 / 解析 / 增量 / 收敛 / 白名单 / 安全锁 / 门控 / 故障分支 / 基线可信 / 强杀 / 输出字节上限 / Tier3 上下文 / 插件
 bunx tsc --noEmit    # 严格模式类型检查
 ```
 
